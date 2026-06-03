@@ -28,6 +28,7 @@ import { ScoreInfoPanel } from '../components/ScoreInfoPanel';
 import { OMRSettings } from '../services/OMRSettings';
 import { OMRCacheService } from '../services/OMRCacheService';
 import { NativeAudioBridge } from '../services/NativeAudioBridge';
+import { separateSATBFromEvents } from '../services/satb-from-events';
 import { getStatusBarStyleForTheme } from '../theme/themes';
 import { buildThemedLogoHtml } from '../utils/logoTheme';
 
@@ -82,6 +83,19 @@ const INSTRUMENT_PRIORITY = [
   'grand piano',
   'violin',
   'jazz guitar',
+];
+
+const SOUND_FONT_SOURCES = [
+  {
+    key: 'default',
+    label: 'Default',
+    asset: require('../../assets/SheetMusicScanner.sf2'),
+  },
+  {
+    key: 'choir',
+    label: 'Choir',
+    asset: require('../../assets/choir_choral_aahhs_4959kb.sf2'),
+  },
 ];
 
 function orderInstrumentPresets(presets) {
@@ -199,6 +213,8 @@ export const PlaybackScreen = ({ imageUri, scoreData: incomingScoreData, scoreEn
   // Instrument preset selection
   const [availablePresets, setAvailablePresets] = useState([]);
   const [selectedPresetIndex, setSelectedPresetIndex] = useState(0);
+  const [selectedSoundFontKey, setSelectedSoundFontKey] = useState('default');
+  const [loadingSoundFontKey, setLoadingSoundFontKey] = useState('');
   const [showInstrumentPicker, setShowInstrumentPicker] = useState(false);
   const [showOverflowMenu, setShowOverflowMenu] = useState(false);
 
@@ -255,6 +271,25 @@ export const PlaybackScreen = ({ imageUri, scoreData: incomingScoreData, scoreEn
   const playbackVoiceSelection = useMemo(() => {
     return effectiveVoiceSelection;
   }, [effectiveVoiceSelection]);
+
+  const loadSoundFontSource = useCallback(async (sourceKey) => {
+    const source = SOUND_FONT_SOURCES.find((item) => item.key === sourceKey) || SOUND_FONT_SOURCES[0];
+    if (!source) return;
+    setLoadingSoundFontKey(source.key);
+    try {
+      await AudioPlaybackService.loadSoundFont(source.asset, { forceReload: true });
+      const presets = orderInstrumentPresets(AudioPlaybackService.getAvailablePresets());
+      setAvailablePresets(presets);
+      setSelectedPresetIndex(presets[0]?.index ?? 0);
+      AudioPlaybackService.selectPreset(presets[0]?.index ?? 0);
+      setSelectedSoundFontKey(source.key);
+    } catch (e) {
+      console.warn('Failed to load SoundFont source:', e?.message || e);
+      Alert.alert('SoundFont load failed', e?.message || 'Unable to load selected instrument bank.');
+    } finally {
+      setLoadingSoundFontKey('');
+    }
+  }, []);
 
   const allVisibleVoicesSelected = useMemo(() => {
     return Object.values(voiceSelection).every(Boolean);
@@ -639,18 +674,11 @@ export const PlaybackScreen = ({ imageUri, scoreData: incomingScoreData, scoreEn
     if (imageUri && !incomingScoreData) {
       processScore();
     }
-    // Load SoundFont for high-quality playback (non-blocking)
-    AudioPlaybackService.loadSoundFont(
-      require('../../assets/SheetMusicScanner.sf2')
-    ).then(() => {
-      const presets = AudioPlaybackService.getAvailablePresets();
-      if (presets.length > 0) {
-        const orderedPresets = orderInstrumentPresets(presets);
-        setAvailablePresets(orderedPresets);
-        setSelectedPresetIndex(orderedPresets[0]?.index ?? 0);
-      }
-    });
   }, [processScore, imageUri, incomingScoreData]);
+
+  useEffect(() => {
+    loadSoundFontSource(selectedSoundFontKey);
+  }, [loadSoundFontSource, selectedSoundFontKey]);
 
   useEffect(() => {
     if (scoreViewMode !== 'rendered') return;
@@ -1244,8 +1272,66 @@ export const PlaybackScreen = ({ imageUri, scoreData: incomingScoreData, scoreEn
     }
   };
 
+  const handleExportSatbMusicXml = async () => {
+    if (!scoreData?.notes?.length) {
+      Alert.alert('No score data', 'No notes detected for SATB export. Please rescan the score.');
+      return;
+    }
+
+    try {
+      setPreparing(true);
+      setPreparingStatusText('Preparing SATB export...');
+      await AudioPlaybackService.stop();
+      setIsPlaying(false);
+      setIsPaused(false);
+
+      const playbackNotes = getLiteralPlaybackNotes(scoreData);
+      const prepared = AudioPlaybackService.prepareNoteEvents(playbackNotes, {
+        measureBeats: scoreData?.metadata?.measureBeats,
+      });
+      if (!prepared || !prepared.noteEvents) {
+        throw new Error('Cannot prepare note events for SATB export (timing data unavailable).');
+      }
+
+      const { noteEvents, timingBeatData } = prepared;
+      const { xml, report } = separateSATBFromEvents(noteEvents, timingBeatData || []);
+      if (!xml) throw new Error('SATB export produced no output.');
+
+      const titleBase = (scoreData?.metadata?.title || 'notescan_score')
+        .replace(/[^a-zA-Z0-9_-]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 50) || 'notescan_score';
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const fileName = `${titleBase}_SATB_${stamp}.musicxml`;
+      const file = new File(Paths.document, fileName);
+
+      await file.write(xml);
+
+      const canShare = await Sharing.isAvailableAsync();
+      if (!canShare) {
+        Alert.alert('Exported', `Saved SATB MusicXML to: ${file.uri}`);
+        return;
+      }
+
+      await Sharing.shareAsync(file.uri, {
+        mimeType: 'application/vnd.recordare.musicxml+xml',
+        dialogTitle: 'Export SATB MusicXML',
+        UTI: 'public.xml',
+      });
+
+      Alert.alert('SATB Exported', `Measures processed: ${report.measuresProcessed}`);
+    } catch (e) {
+      console.error('SATB export failed:', e);
+      Alert.alert('Export failed', e?.message || 'Could not export SATB MusicXML file.');
+    } finally {
+      setPreparing(false);
+      setPreparingStatusText('');
+    }
+  };
+
   const currentInstrumentName =
     availablePresets.find((preset) => preset.index === selectedPresetIndex)?.name || 'Piano';
+  const instrumentStatusLabel = `${currentInstrumentName} (${selectedSoundFontKey}${loadingSoundFontKey ? ' loading' : ''})`;
   const pitchShiftLabel = `${Math.round(pitchHz)} Hz`;
   const livePitchShiftLabel = `${Math.round(pitchSliderHz)} Hz`;
   const selectedPitchPipe = PITCH_PIPE_NOTES[pitchPipeIndex] || PITCH_PIPE_NOTES[9];
@@ -1940,7 +2026,7 @@ export const PlaybackScreen = ({ imageUri, scoreData: incomingScoreData, scoreEn
             >
               <Feather name="music" size={12} color={barPalette.barTextMuted} />
               <Text style={styles.pillText} numberOfLines={1}>
-                {currentInstrumentName}
+                {instrumentStatusLabel}
               </Text>
             </Pressable>
           )}
@@ -1999,6 +2085,17 @@ export const PlaybackScreen = ({ imageUri, scoreData: incomingScoreData, scoreEn
               >
                 <Feather name="music" size={14} color={theme.inkMuted} />
                 <Text style={[styles.overflowActionText, { color: theme.ink }]}>Export WAV</Text>
+              </Pressable>
+
+              <Pressable
+                style={({ pressed }) => [styles.overflowActionRow, { borderBottomColor: theme.border, backgroundColor: pressed ? theme.surfaceStrong : 'transparent' }]}
+                onPress={() => {
+                  setShowOverflowMenu(false);
+                  handleExportSatbMusicXml();
+                }}
+              >
+                <Feather name="users" size={14} color={theme.inkMuted} />
+                <Text style={[styles.overflowActionText, { color: theme.ink }]}>Export SATB XML</Text>
               </Pressable>
 
               {scoreViewMode === 'rendered' && (
@@ -2180,6 +2277,28 @@ export const PlaybackScreen = ({ imageUri, scoreData: incomingScoreData, scoreEn
               <TouchableOpacity onPress={() => setShowInstrumentPicker(false)}>
                 <Feather name="x" size={22} color={palette.ink} />
               </TouchableOpacity>
+            </View>
+            <View style={styles.soundFontSelector}>
+              {SOUND_FONT_SOURCES.map((source) => {
+                const active = source.key === selectedSoundFontKey;
+                const loading = source.key === loadingSoundFontKey;
+                return (
+                  <TouchableOpacity
+                    key={source.key}
+                    style={[
+                      styles.soundFontChip,
+                      active && styles.soundFontChipActive,
+                      loading && styles.soundFontChipLoading,
+                    ]}
+                    onPress={() => setSelectedSoundFontKey(source.key)}
+                    disabled={loading}
+                  >
+                    <Text style={[styles.soundFontChipText, active && styles.soundFontChipTextActive]}>
+                      {loading ? 'Loading…' : source.label}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
             </View>
             <FlatList
               data={availablePresets}
@@ -2714,6 +2833,35 @@ const styles = StyleSheet.create({
   instrumentNameActive: {
     color: barPalette.accent,
     fontWeight: '800',
+  },
+  soundFontSelector: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+    marginBottom: 14,
+  },
+  soundFontChip: {
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    borderRadius: 999,
+    backgroundColor: palette.surfaceStrong,
+    borderWidth: 1,
+    borderColor: palette.border,
+  },
+  soundFontChipActive: {
+    backgroundColor: '#1C1B19',
+    borderColor: '#1C1B19',
+  },
+  soundFontChipLoading: {
+    opacity: 0.7,
+  },
+  soundFontChipText: {
+    color: palette.ink,
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  soundFontChipTextActive: {
+    color: '#F3F1EA',
   },
   audioControlsOverlay: {
     flex: 1,

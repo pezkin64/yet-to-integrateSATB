@@ -1,6 +1,7 @@
 import { Audio } from 'expo-av';
 import { File, Paths } from 'expo-file-system/next';
 import { SoundFontService } from './SoundFontService';
+import { assignPlaybackVoices, collapseVoiceOnsets, resolvePlaybackVoice, getPlaybackVoices, noteMatchesVoiceSelection } from './VoiceGroupService';
 
 // react-native-audio-api requires a dev build (native module).
 // Gracefully degrade when running in Expo Go.
@@ -154,12 +155,16 @@ export class AudioPlaybackService {
    * Defaults to Grand Piano (first preset in the SF2).
    * @param {number} sf2Asset - result of require('./SheetMusicScanner.sf2')
    */
-  static async loadSoundFont(sf2Asset) {
+  static async loadSoundFont(sf2Asset, options = {}) {
     try {
-      await SoundFontService.loadSoundFont(sf2Asset);
+      await SoundFontService.loadSoundFont(sf2Asset, options);
       this._soundFontReady = SoundFontService.isLoaded;
       if (this._soundFontReady) {
         console.log('🎹 SoundFont loaded — using high-quality samples');
+        try {
+          const presets = SoundFontService.getAvailablePresets();
+          console.log('🎹 Presets loaded:', presets.map(p=>p.name).slice(0,20));
+        } catch(e) { console.warn('Could not list presets after load', e); }
       }
     } catch (e) {
       console.warn('SoundFont load failed, using synthesis fallback:', e);
@@ -743,13 +748,14 @@ export class AudioPlaybackService {
     // This maps musical time (beats) to horizontal screen position
     // totalBeats maps to max x (assume ~1200px for landscape sheet music)
     const SYNTHESIZED_WIDTH = 1200;
-    const noteEvents = noteFormatted.map(n => {
+    const assignedEvents = assignPlaybackVoices(noteFormatted.map(n => {
       const synthX = (n.beatOffset / totalBeats) * SYNTHESIZED_WIDTH;
       return {
         ...n,
         x: n.x > 0 ? n.x : synthX, // Use OCR x if available, else synthesized
       };
-    });
+    }));
+    const noteEvents = collapseVoiceOnsets(assignedEvents);
 
     const rests = notes
       .filter(n => n.type === 'rest' && Number.isFinite(n.beatOffset))
@@ -785,7 +791,7 @@ export class AudioPlaybackService {
       const avgX = group.reduce((s, n) => s + n.x, 0) / group.length;
       const avgY = group.reduce((s, n) => s + n.y, 0) / group.length;
       // Per-voice positions for voice-aware subtle dots
-      const voicePositions = group.map(n => ({ voice: n.voice, y: n.y, x: n.x }));
+      const voicePositions = group.map(n => ({ voice: resolvePlaybackVoice(n), y: n.y, x: n.x }));
       timingBeatData.push({
         beatOffset: bo,
         beatOffsetCanonical: Math.min(...group.map((n) => n.beatOffsetCanonical ?? n.beatOffset)),
@@ -969,7 +975,7 @@ export class AudioPlaybackService {
       time: (e.beatOffsetCanonical ?? e.beatOffset) * spb,
       endTime: ((e.beatOffsetCanonical ?? e.beatOffset) + e.durationBeats) * spb,
       midiNote: e.midiNote,
-      voice: e.voice,
+      voice: resolvePlaybackVoice(e),
     })).sort((a, b) => a.time - b.time);
   }
 
@@ -986,7 +992,7 @@ export class AudioPlaybackService {
     const t1 = (startSample + chunkSize) / sampleRate;
 
     for (const evt of this._noteEvents) {
-      if (this._voiceSelection && !this._voiceSelection[evt.voice]) continue;
+      if (this._voiceSelection && !noteMatchesVoiceSelection(evt, this._voiceSelection)) continue;
 
       const noteStart = evt.beatOffset * spb;
       const noteDur = evt.durationBeats * spb;
@@ -1298,7 +1304,7 @@ export class AudioPlaybackService {
       const avgY = group.reduce((s, n) => s + (n.y || 0), 0) / group.length;
       const si = group[0].staffIndex;
       const voicePositions = group.map((n) => ({
-        voice: n.voice,
+        voice: resolvePlaybackVoice(n),
         x: Number.isFinite(n.x) ? n.x : avgX,
         y: Number.isFinite(n.y) ? n.y : avgY,
       }));
@@ -1431,7 +1437,8 @@ export class AudioPlaybackService {
         return null;
       }
 
-      const realNotes = notes.filter(n => n.type !== 'rest' && n.midiNote != null);
+      const canonicalNotes = collapseVoiceOnsets(assignPlaybackVoices(notes));
+      const realNotes = canonicalNotes.filter(n => n.type !== 'rest' && n.midiNote != null);
       beatMap = new Map();
       for (const n of realNotes) {
         const bo = this._normalizeBeatOffset(n.beatOffset);
@@ -1439,7 +1446,7 @@ export class AudioPlaybackService {
         beatMap.get(bo).push(n);
       }
       beatPositions = [...beatMap.keys()].sort((a, b) => a - b);
-      rests = notes.filter(n => n.type === 'rest' && typeof n.beatOffset === 'number');
+      rests = canonicalNotes.filter(n => n.type === 'rest' && typeof n.beatOffset === 'number');
 
       this._cachedNotes = notes;
       this._cachedBeatData = { beatMap, beatPositions, rests, getBeats };
@@ -1453,7 +1460,7 @@ export class AudioPlaybackService {
       const avgX = group.reduce((s, n) => s + (n.x || 0), 0) / group.length;
       const avgY = group.reduce((s, n) => s + (n.y || 0), 0) / group.length;
       const voicePositions = group.map((n) => ({
-        voice: n.voice,
+        voice: resolvePlaybackVoice(n),
         x: Number.isFinite(n.x) ? n.x : avgX,
         y: Number.isFinite(n.y) ? n.y : avgY,
       }));
@@ -1498,13 +1505,16 @@ export class AudioPlaybackService {
       const group = beatMap.get(bo);
       const offsetSamples = Math.floor(bo * secondsPerBeat * sampleRate);
       for (const n of group) {
-        const voice = n.voice || 'Soprano';
-        const buf = buffers[voice] || buffers.Soprano;
+        const voices = getPlaybackVoices(n);
+        const renderVoices = voices.length > 0 ? voices : [resolvePlaybackVoice(n)];
         const dur = getBeats(n) * secondsPerBeat;
         const noteAudio = this.generatePianoNote(n.midiNote, dur);
         const start = offsetSamples;
         const len = Math.min(noteAudio.length, totalSamples - start);
-        for (let i = 0; i < len; i++) buf[start + i] += noteAudio[i];
+        for (const voice of renderVoices) {
+          const buf = buffers[voice] || buffers.Soprano;
+          for (let i = 0; i < len; i++) buf[start + i] += noteAudio[i];
+        }
       }
     }
 

@@ -14,6 +14,7 @@ import { File } from 'expo-file-system/next';
 class SoundFontServiceClass {
   _loaded = false;
   _loading = false;
+  _loadedAssetKey = null;
 
   /** Raw 16-bit PCM sample pool (Int16Array) */
   _sampleData = null;
@@ -54,8 +55,17 @@ class SoundFontServiceClass {
    * Load and parse the SoundFont file.
    * @param {number} assetModule - result of require('./SheetMusicScanner.sf2')
    */
-  async loadSoundFont(assetModule) {
-    if (this._loaded || this._loading) return;
+  async loadSoundFont(assetModule, options = {}) {
+    const forceReload = options.forceReload === true;
+    const assetKey = typeof assetModule === 'number' ? assetModule : assetModule?.uri || assetModule?.localUri || String(assetModule || '');
+
+    if (this._loading) return;
+    if (this._loaded && !forceReload && this._loadedAssetKey === assetKey) return;
+
+    if (forceReload || (this._loaded && this._loadedAssetKey !== assetKey)) {
+      this._resetState();
+    }
+
     this._loading = true;
 
     try {
@@ -81,6 +91,7 @@ class SoundFontServiceClass {
       this._selectPresetByIndex(0);
 
       this._loaded = true;
+      this._loadedAssetKey = assetKey;
       console.log(
         `✅ SoundFont ready: ${this._sampleHeaders.length} samples, ` +
         `${this._allZones.length} total zones, ${this._presets.length} presets, ` +
@@ -92,6 +103,18 @@ class SoundFontServiceClass {
     } finally {
       this._loading = false;
     }
+  }
+
+  _resetState() {
+    this._loaded = false;
+    this._sampleData = null;
+    this._sampleHeaders = [];
+    this._allZones = [];
+    this._zones = [];
+    this._noteToZone = new Map();
+    this._presets = [];
+    this._activePresetIndex = 0;
+    this._loadedAssetKey = null;
   }
 
   /* ────────────────────────────────────────────
@@ -548,7 +571,8 @@ class SoundFontServiceClass {
         const m = mergeWithGlobal(zoneGens, gbl);
         const sh = this._sampleHeaders[m.sampleIndex];
         // Skip ROM samples and linked samples we can't use
-        if (sh.sampleType > 1) continue;
+        // Accept stereo/linked sample types (do not skip when sampleType > 1)
+        // if (sh.sampleType > 1) continue;
 
         const zone = {
           keyLo:   m.keyLo,
