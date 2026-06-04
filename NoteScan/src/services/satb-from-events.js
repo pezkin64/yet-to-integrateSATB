@@ -11,6 +11,15 @@ function midiToPitch(midi) {
   return { step: name[0], alter: 1, octave };
 }
 
+function normalizeBeatOffset(beat) {
+  if (!Number.isFinite(beat)) return 0;
+  return Math.round(beat * 1000000) / 1000000;
+}
+
+function beatsToTicks(beats, divisions) {
+  return Math.max(1, Math.round(Math.max(0, beats) * divisions));
+}
+
 function durationTypeStrSimple(durBeats, divisions) {
   // reuse simple mapping quarter=1
   const ratio = durBeats / (divisions / 2); // if divisions==2, ratio=durBeats
@@ -40,14 +49,33 @@ export function separateSATBFromEvents(noteEvents, timingBeatData = [], options 
     return { xml: '', report: { measuresProcessed: 0, noteCounts: {}, restCounts: {} } };
   }
 
-  // Group by measureNum and beatOffset
+  // Group by measureNum and normalized beatOffset so tiny timing noise does not split chords.
   const measuresMap = new Map();
+  const measureMetaMap = new Map();
   let maxMeasure = 0;
+  const timingEntries = Array.isArray(timingBeatData) ? timingBeatData : [];
+  for (const t of timingEntries) {
+    const measureNum = Number.isFinite(t?.measureNum) && t.measureNum > 0 ? t.measureNum : null;
+    if (!measureNum) continue;
+    const startBeat = Number.isFinite(t.measureStartBeat) ? t.measureStartBeat : null;
+    const endBeat = Number.isFinite(t.measureEndBeat) ? t.measureEndBeat : null;
+    if (!measureMetaMap.has(measureNum)) {
+      measureMetaMap.set(measureNum, {
+        startBeat: startBeat ?? 0,
+        endBeat: endBeat ?? ((startBeat ?? 0) + 4),
+      });
+    } else {
+      const meta = measureMetaMap.get(measureNum);
+      if (startBeat != null && startBeat < meta.startBeat) meta.startBeat = startBeat;
+      if (endBeat != null && endBeat > meta.endBeat) meta.endBeat = endBeat;
+    }
+  }
+
   for (const e of noteEvents) {
     const mnum = Number.isFinite(e.measureNum) && e.measureNum > 0 ? e.measureNum : 1;
     maxMeasure = Math.max(maxMeasure, mnum);
     if (!measuresMap.has(mnum)) measuresMap.set(mnum, new Map());
-    const beat = Number.isFinite(e.beatOffset) ? e.beatOffset : 0;
+    const beat = normalizeBeatOffset(e.beatOffsetCanonical ?? e.beatOffsetCompressed ?? e.beatOffset);
     const beatMap = measuresMap.get(mnum);
     if (!beatMap.has(beat)) beatMap.set(beat, []);
     beatMap.get(beat).push(e);
@@ -88,16 +116,44 @@ export function separateSATBFromEvents(noteEvents, timingBeatData = [], options 
   const parts = { S: [], A: [], T: [], B: [] };
   const noteCounts = { Soprano:0, Alto:0, Tenor:0, Bass:0 };
   const restCounts = { Soprano:0, Alto:0, Tenor:0, Bass:0 };
+  const measureEnds = new Map();
+
+  const emitRest = (partMeasures, partKey, beats) => {
+    if (!(beats > 0)) return;
+    const typeStr = durationTypeStrSimple(beats, divisions);
+    partMeasures[partKey].push(restXml(beatsToTicks(beats, divisions), typeStr, 1));
+    restCounts[partKey === 'S' ? 'Soprano' : partKey === 'A' ? 'Alto' : partKey === 'T' ? 'Tenor' : 'Bass']++;
+  };
+
+  const emitNote = (partMeasures, partKey, event, fallbackBeats) => {
+    if (!event) return;
+    const durationBeats = Number.isFinite(event.durationBeats) && event.durationBeats > 0
+      ? event.durationBeats
+      : (Number.isFinite(fallbackBeats) && fallbackBeats > 0 ? fallbackBeats : 1);
+    const typeStr = durationTypeStrSimple(durationBeats, divisions);
+    partMeasures[partKey].push(noteXmlFromMidi(event.midiNote, beatsToTicks(durationBeats, divisions), typeStr, 1));
+    noteCounts[partKey === 'S' ? 'Soprano' : partKey === 'A' ? 'Alto' : partKey === 'T' ? 'Tenor' : partKey === 'B' ? 'Bass' : 'Bass']++;
+    return durationBeats;
+  };
 
   for (let m = 1; m <= maxMeasure; m++) {
     const beatMap = measuresMap.get(m) || new Map();
     const beatOffsets = [...beatMap.keys()].sort((a,b)=>a-b);
+    const measureMeta = measureMetaMap.get(m) || { startBeat: 0, endBeat: 4 };
+    const measureStartBeat = Number.isFinite(measureMeta.startBeat) ? measureMeta.startBeat : 0;
+    const measureEndBeat = Number.isFinite(measureMeta.endBeat) && measureMeta.endBeat > measureStartBeat
+      ? measureMeta.endBeat
+      : measureStartBeat + 4;
+    const measureLengthBeats = Math.max(0.25, measureEndBeat - measureStartBeat);
+
     // If empty measure, insert a whole rest in all parts
     if (beatOffsets.length === 0) {
-      parts.S.push([ restXml(divisions*4, 'whole', 1) ]);
-      parts.A.push([ restXml(divisions*4, 'whole', 1) ]);
-      parts.T.push([ restXml(divisions*4, 'whole', 1) ]);
-      parts.B.push([ restXml(divisions*4, 'whole', 1) ]);
+      const restType = durationTypeStrSimple(measureLengthBeats, divisions);
+      const restTicks = beatsToTicks(measureLengthBeats, divisions);
+      parts.S.push([ restXml(restTicks, restType, 1) ]);
+      parts.A.push([ restXml(restTicks, restType, 1) ]);
+      parts.T.push([ restXml(restTicks, restType, 1) ]);
+      parts.B.push([ restXml(restTicks, restType, 1) ]);
       restCounts.Soprano++; restCounts.Alto++; restCounts.Tenor++; restCounts.Bass++;
       continue;
     }
@@ -106,9 +162,26 @@ export function separateSATBFromEvents(noteEvents, timingBeatData = [], options 
     const altoNotes = [];
     const tenorNotes = [];
     const bassNotes = [];
+    const cursors = { S: 0, A: 0, T: 0, B: 0 };
+
+    const fillGap = (partKey, onsetRelBeat) => {
+      const gap = onsetRelBeat - cursors[partKey];
+      if (gap > 1e-6) {
+        emitRest({ S: soprNotes, A: altoNotes, T: tenorNotes, B: bassNotes }, partKey, gap);
+        cursors[partKey] += gap;
+      }
+    };
+
+    const appendNote = (partKey, event, onsetRelBeat, fallbackBeats) => {
+      fillGap(partKey, onsetRelBeat);
+      if (!event) return;
+      const usedBeats = emitNote({ S: soprNotes, A: altoNotes, T: tenorNotes, B: bassNotes }, partKey, event, fallbackBeats);
+      cursors[partKey] = onsetRelBeat + (usedBeats || fallbackBeats || 1);
+    };
 
     for (const bo of beatOffsets) {
       const evs = beatMap.get(bo) || [];
+      const onsetRelBeat = Math.max(0, bo - measureStartBeat);
       // split by staffIndex: assume smaller staffIndex = treble
       const staffs = new Map();
       for (const ev of evs) {
@@ -123,37 +196,44 @@ export function separateSATBFromEvents(noteEvents, timingBeatData = [], options 
       const treAssigned = assignUpperLower(trebleEvents);
       const bassAssigned = assignUpperLower(bassEvents);
 
-      // durations in ticks (divisions=2 means quarter=2 ticks)
-      const durationBeats = evs[0]?.durationBeats || 1;
-      const durationTicks = Math.max(1, Math.round(durationBeats * divisions));
-      const typeStr = durationTypeStrSimple(durationBeats, divisions);
-
       if (treAssigned.upper) {
-        soprNotes.push(noteXmlFromMidi(treAssigned.upper.midiNote, durationTicks, typeStr, 1));
-        noteCounts.Soprano++;
+        appendNote('S', treAssigned.upper, onsetRelBeat, treAssigned.upper.durationBeats);
       } else {
-        soprNotes.push(restXml(durationTicks, typeStr, 1)); restCounts.Soprano++;
+        appendNote('S', null, onsetRelBeat, 0);
       }
       if (treAssigned.lower) {
-        altoNotes.push(noteXmlFromMidi(treAssigned.lower.midiNote, durationTicks, typeStr, 1));
-        noteCounts.Alto++;
+        appendNote('A', treAssigned.lower, onsetRelBeat, treAssigned.lower.durationBeats);
       } else {
-        altoNotes.push(restXml(durationTicks, typeStr, 1)); restCounts.Alto++;
+        appendNote('A', null, onsetRelBeat, 0);
       }
 
       if (bassAssigned.upper) {
-        tenorNotes.push(noteXmlFromMidi(bassAssigned.upper.midiNote, durationTicks, typeStr, 1));
-        noteCounts.Tenor++;
+        appendNote('T', bassAssigned.upper, onsetRelBeat, bassAssigned.upper.durationBeats);
       } else {
-        tenorNotes.push(restXml(durationTicks, typeStr, 1)); restCounts.Tenor++;
+        appendNote('T', null, onsetRelBeat, 0);
       }
       if (bassAssigned.lower) {
-        bassNotes.push(noteXmlFromMidi(bassAssigned.lower.midiNote, durationTicks, typeStr, 1));
-        noteCounts.Bass++;
+        appendNote('B', bassAssigned.lower, onsetRelBeat, bassAssigned.lower.durationBeats);
       } else {
-        bassNotes.push(restXml(durationTicks, typeStr, 1)); restCounts.Bass++;
+        appendNote('B', null, onsetRelBeat, 0);
       }
     }
+
+    const remainingS = measureLengthBeats - cursors.S;
+    const remainingA = measureLengthBeats - cursors.A;
+    const remainingT = measureLengthBeats - cursors.T;
+    const remainingB = measureLengthBeats - cursors.B;
+    if (remainingS > 1e-6) emitRest({ S: soprNotes, A: altoNotes, T: tenorNotes, B: bassNotes }, 'S', remainingS);
+    if (remainingA > 1e-6) emitRest({ S: soprNotes, A: altoNotes, T: tenorNotes, B: bassNotes }, 'A', remainingA);
+    if (remainingT > 1e-6) emitRest({ S: soprNotes, A: altoNotes, T: tenorNotes, B: bassNotes }, 'T', remainingT);
+    if (remainingB > 1e-6) emitRest({ S: soprNotes, A: altoNotes, T: tenorNotes, B: bassNotes }, 'B', remainingB);
+
+    measureEnds.set(m, {
+      S: cursors.S + Math.max(0, remainingS),
+      A: cursors.A + Math.max(0, remainingA),
+      T: cursors.T + Math.max(0, remainingT),
+      B: cursors.B + Math.max(0, remainingB),
+    });
 
     parts.S.push(soprNotes);
     parts.A.push(altoNotes);
@@ -215,14 +295,14 @@ export function separateSATBFromEvents(noteEvents, timingBeatData = [], options 
   // Measure length validation
   const measureMismatches = [];
   for (let m = 1; m <= maxMeasure; m++) {
-    const beatMap = measuresMap.get(m) || new Map();
-    // Sum durationBeats of all events in this measure
-    let actualBeats = 0;
-    for (const events of beatMap.values()) {
-      for (const ev of events) {
-        actualBeats += Number.isFinite(ev.durationBeats) ? ev.durationBeats : 0;
-      }
-    }
+    const measureEndState = measureEnds.get(m) || {};
+    const actualBeats = Math.max(
+      0,
+      Number.isFinite(measureEndState.S) ? measureEndState.S : 0,
+      Number.isFinite(measureEndState.A) ? measureEndState.A : 0,
+      Number.isFinite(measureEndState.T) ? measureEndState.T : 0,
+      Number.isFinite(measureEndState.B) ? measureEndState.B : 0,
+    );
     // Determine expected beats from timingBeatData if available
     const timingEntry = (Array.isArray(timingBeatData) && timingBeatData.find(t => Number.isFinite(t.measureNum) && t.measureNum === m));
     const expectedBeats = timingEntry && Number.isFinite(timingEntry.measureEndBeat) && Number.isFinite(timingEntry.measureStartBeat)

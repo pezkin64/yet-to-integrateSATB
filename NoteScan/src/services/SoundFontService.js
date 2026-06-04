@@ -15,6 +15,8 @@ class SoundFontServiceClass {
   _loaded = false;
   _loading = false;
   _loadedAssetKey = null;
+  _loadPromise = null;
+  _loadToken = 0;
 
   /** Raw 16-bit PCM sample pool (Int16Array) */
   _sampleData = null;
@@ -59,8 +61,13 @@ class SoundFontServiceClass {
     const forceReload = options.forceReload === true;
     const assetKey = typeof assetModule === 'number' ? assetModule : assetModule?.uri || assetModule?.localUri || String(assetModule || '');
 
-    if (this._loading) return;
-    if (this._loaded && !forceReload && this._loadedAssetKey === assetKey) return;
+    if (this._loaded && !forceReload && this._loadedAssetKey === assetKey) {
+      return;
+    }
+
+    if (this._loading && !forceReload && this._loadedAssetKey === assetKey && this._loadPromise) {
+      return this._loadPromise;
+    }
 
     if (forceReload || (this._loaded && this._loadedAssetKey !== assetKey)) {
       this._resetState();
@@ -68,7 +75,9 @@ class SoundFontServiceClass {
 
     this._loading = true;
 
-    try {
+    const loadToken = ++this._loadToken;
+    this._loadPromise = (async () => {
+      try {
       console.log('🎵 Loading SoundFont...');
 
       // Download the asset to a local file
@@ -90,6 +99,8 @@ class SoundFontServiceClass {
       // Default to the first preset (typically Grand Piano / Acoustic Grand)
       this._selectPresetByIndex(0);
 
+      if (loadToken !== this._loadToken) return;
+
       this._loaded = true;
       this._loadedAssetKey = assetKey;
       console.log(
@@ -97,12 +108,20 @@ class SoundFontServiceClass {
         `${this._allZones.length} total zones, ${this._presets.length} presets, ` +
         `active preset: "${this._presets[0]?.name || 'none'}"`
       );
-    } catch (err) {
-      console.error('❌ SoundFont load error:', err);
-      // Non-fatal — the app falls back to synthesis
-    } finally {
-      this._loading = false;
-    }
+      } catch (err) {
+        if (loadToken === this._loadToken) {
+          console.error('❌ SoundFont load error:', err);
+          // Non-fatal — the app falls back to synthesis
+        }
+      } finally {
+        if (loadToken === this._loadToken) {
+          this._loading = false;
+          this._loadPromise = null;
+        }
+      }
+    })();
+
+    return this._loadPromise;
   }
 
   _resetState() {
@@ -115,6 +134,7 @@ class SoundFontServiceClass {
     this._presets = [];
     this._activePresetIndex = 0;
     this._loadedAssetKey = null;
+    this._loadPromise = null;
   }
 
   /* ────────────────────────────────────────────

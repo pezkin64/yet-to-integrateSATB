@@ -51,7 +51,9 @@ const VOICE_NAMES = { 1: 'Soprano', 2: 'Alto', 3: 'Tenor', 4: 'Bass' };
  *                        bass   (staff 2) → Tenor/Bass.
  * For multi-part: uses the global staff index to determine position.
  */
-function staffVoiceToSATB(staffNum, voiceNum, stavesInPart) {
+function staffVoiceToSATB(staffNum, voiceNum, stavesInPart, partClef = 'treble') {
+  const clef = String(partClef || 'treble').toLowerCase();
+
   if (stavesInPart >= 2) {
     // Grand staff (piano, organ, etc.)
     // Staff 1 (treble): voice 1→Soprano, voice 2→Alto
@@ -62,6 +64,16 @@ function staffVoiceToSATB(staffNum, voiceNum, stavesInPart) {
       return voiceNum <= 1 ? 'Tenor' : 'Bass';
     }
   }
+
+  // Single-staff parts still need clef-aware routing.
+  // A bass-clef staff should map to Tenor/Bass; a treble-clef staff to Soprano/Alto.
+  if (clef === 'bass') {
+    return voiceNum <= 1 ? 'Tenor' : 'Bass';
+  }
+  if (clef === 'alto' || clef === 'tenor') {
+    return voiceNum <= 1 ? 'Alto' : 'Bass';
+  }
+
   // Single-staff part: use voice number directly
   return VOICE_NAMES[voiceNum] || VOICE_NAMES[((voiceNum - 1) % 4) + 1];
 }
@@ -293,7 +305,8 @@ export class MusicXMLParser {
           const staffNum = parseInt(noteXml.match(/<staff>(\d+)<\/staff>/)?.[1] || '1');
           const staffIdx = globalStaffOffset + staffNum - 1;
           const voiceNum = parseInt(noteXml.match(/<voice>(\d+)<\/voice>/)?.[1] || '1');
-          const voiceName = staffVoiceToSATB(staffNum, voiceNum, stavesInPart);
+          const activeClef = currentClefs[staffNum] || currentClefs[1] || Object.values(currentClefs)[0] || 'treble';
+          const voiceName = staffVoiceToSATB(staffNum, voiceNum, stavesInPart, activeClef);
           const vKey = getVoiceKey(staffNum, voiceNum);
 
           // Initialize voice position on first encounter
@@ -555,7 +568,12 @@ export class MusicXMLParser {
       maxVoiceCount >= (minVoiceCount * 3)
     );
 
-    if ((emptyVoices.length >= 2 || severeImbalance) && noteCount > 1) {
+    const shouldRedistributeVoices =
+      (emptyVoices.length >= 2 || severeImbalance) &&
+      noteCount > 1 &&
+      Object.keys(voiceCounts).length <= 1;
+
+    if (shouldRedistributeVoices) {
       if (severeImbalance && emptyVoices.length < 2) {
         console.log(
           `🎤 SATB imbalance detected: max=${maxVoiceCount}, min=${minVoiceCount}, ` +
@@ -566,6 +584,7 @@ export class MusicXMLParser {
       const total = pitched.length;
 
       if (total >= 2) {
+
         // ── Step 1: Group notes by beatOffset (simultaneous notes) ──
         const beatGroups = new Map(); // beatOffset → [note, note, ...]
         for (const n of pitched) {
@@ -576,7 +595,9 @@ export class MusicXMLParser {
 
         // ── Step 2: Per-beat assignment for chords (2+ notes at same beat) ──
         const upperVoiceOrder = ['Soprano', 'Alto', 'Tenor', 'Bass'];
-        const lowerVoiceOrder = ['Tenor', 'Alto', 'Bass', 'Soprano'];
+        // Lower staff should stay anchored to Tenor/Bass first.
+        // Putting Alto here causes the exact voice swapping the user reported.
+        const lowerVoiceOrder = ['Tenor', 'Bass', 'Alto', 'Soprano'];
         const staffMidpoint = Math.max(0, (metadata.staves - 1) / 2);
         const singleNotes = []; // notes alone on their beat — handled in step 3
 
@@ -654,6 +675,51 @@ export class MusicXMLParser {
         if (n.type === 'note') voiceCounts[n.voice] = (voiceCounts[n.voice] || 0) + 1;
       }
       console.log(`🎤 After redistribution:`, JSON.stringify(voiceCounts));
+    }
+
+    // Always correct same-beat, same-staff chord clusters.
+    // This is the important SATB fix for scores that encode both notes in one voice.
+    const chordGroups = new Map();
+    const pitchedNotes = notes.filter((n) => n.type === 'note' && n.midiNote != null && Number.isFinite(n.beatOffset));
+    const staffChordAssignments = { upper: 0, lower: 0 };
+    const upperOrder = ['Soprano', 'Alto', 'Tenor', 'Bass'];
+    const lowerOrder = ['Tenor', 'Bass', 'Alto', 'Soprano'];
+    const chordStaffMidpoint = Math.max(0, (metadata.staves - 1) / 2);
+
+    for (const n of pitchedNotes) {
+      const beatKey = this._normalizeBeatOffset ? this._normalizeBeatOffset(n.beatOffset) : Math.round(n.beatOffset * 10000) / 10000;
+      const staffKey = Number.isFinite(n.staffIndex) ? n.staffIndex : -1;
+      const systemKey = Number.isFinite(n.systemIndex) ? n.systemIndex : -1;
+      const key = `${beatKey}|${staffKey}|${systemKey}`;
+      if (!chordGroups.has(key)) chordGroups.set(key, []);
+      chordGroups.get(key).push(n);
+    }
+
+    for (const group of chordGroups.values()) {
+      if (group.length < 2) continue;
+
+      group.sort((a, b) => {
+        const ay = Number.isFinite(a.y) ? a.y : null;
+        const by = Number.isFinite(b.y) ? b.y : null;
+        if (ay != null && by != null && ay !== by) return ay - by;
+        return b.midiNote - a.midiNote;
+      });
+
+      const avgStaff = group.reduce((sum, n) => sum + (Number.isFinite(n.staffIndex) ? n.staffIndex : chordStaffMidpoint), 0) / group.length;
+      const voiceOrder = avgStaff > chordStaffMidpoint ? lowerOrder : upperOrder;
+
+      for (let i = 0; i < group.length; i++) {
+        group[i].voice = voiceOrder[Math.min(i, voiceOrder.length - 1)];
+      }
+
+      if (avgStaff > chordStaffMidpoint) staffChordAssignments.lower += 1;
+      else staffChordAssignments.upper += 1;
+    }
+
+    if (staffChordAssignments.upper > 0 || staffChordAssignments.lower > 0) {
+      console.log(
+        `🎼 SATB chord pass: upper=${staffChordAssignments.upper}, lower=${staffChordAssignments.lower} chord groups reassigned`
+      );
     }
 
     metadata.voiceCounts = voiceCounts;

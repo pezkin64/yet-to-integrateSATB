@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { StatusBar, View, Text, TouchableOpacity, Alert, ScrollView } from 'react-native';
+import { StatusBar, View, Text, TouchableOpacity, Alert, ScrollView, InteractionManager } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
@@ -9,8 +9,11 @@ import { SettingsScreen } from './src/screens/SettingsScreen';
 import { LibraryScreen } from './src/screens/LibraryScreen';
 import { OMRSettings } from './src/services/OMRSettings';
 import { LibraryService } from './src/services/LibraryService';
+import { AudioPlaybackService } from './src/services/AudioPlaybackService';
 import { ThemeSettings } from './src/services/ThemeSettings';
 import { getThemeById, getStatusBarStyleForTheme } from './src/theme/themes';
+
+const DEFAULT_SOUND_FONT = require('./assets/SheetMusicScanner.sf2');
 
 export default function App() {
   const [currentScreen, setCurrentScreen] = useState('home');
@@ -28,6 +31,13 @@ export default function App() {
   useEffect(() => {
     OMRSettings.load();
     LibraryService.load();
+
+    const preloadTask = InteractionManager.runAfterInteractions(() => {
+      AudioPlaybackService.loadSoundFont(DEFAULT_SOUND_FONT, { background: true }).catch((err) => {
+        console.warn('Background SoundFont preload failed:', err?.message || err);
+      });
+    });
+
     ThemeSettings.load().then((loadedTheme) => {
       if (loadedTheme?.id) {
         setThemeId(loadedTheme.id);
@@ -35,6 +45,9 @@ export default function App() {
     });
 
     return () => {
+      if (typeof preloadTask?.cancel === 'function') {
+        preloadTask.cancel();
+      }
       if (goForwardTimerRef.current) {
         clearTimeout(goForwardTimerRef.current);
         goForwardTimerRef.current = null;

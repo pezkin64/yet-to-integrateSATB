@@ -93,22 +93,14 @@ function assignGroupVoices(group, staffGroup, thresholds) {
 
   if (staffGroup === 'upper') {
     if (sorted.length === 1) {
-      setPlaybackVoices(sorted[0], ['Soprano', 'Alto'], primarySourceVoice || inferVoiceFromY(sorted[0], staffGroup, thresholds) || 'Soprano');
+      const soloVoice = primarySourceVoice || inferVoiceFromY(sorted[0], staffGroup, thresholds) || 'Soprano';
+      setPlaybackVoices(sorted[0], [soloVoice], soloVoice);
       sorted[0].suppressPlayback = false;
       return sorted;
     }
-    if (sourceVoices.size <= 1) {
-      const primary = choosePrimaryNote(sorted);
-      sorted.forEach((note) => {
-        note.suppressPlayback = true;
-        note.playbackVoice = '';
-      });
-      if (primary) {
-        setPlaybackVoices(primary, ['Soprano', 'Alto'], primarySourceVoice || inferVoiceFromY(primary, staffGroup, thresholds) || 'Soprano');
-        primary.suppressPlayback = false;
-      }
-      return sorted;
-    }
+
+    // Multiple notes at the same onset: keep outer notes as SATB voices.
+    // This avoids collapsing both voices into one pitch when source voice labels are noisy.
     sorted.forEach((note, index) => {
       if (index === 0) {
         setPlaybackVoices(note, ['Soprano'], 'Soprano');
@@ -126,22 +118,14 @@ function assignGroupVoices(group, staffGroup, thresholds) {
 
   if (staffGroup === 'lower') {
     if (sorted.length === 1) {
-      setPlaybackVoices(sorted[0], ['Tenor', 'Bass'], primarySourceVoice || inferVoiceFromY(sorted[0], staffGroup, thresholds) || 'Bass');
+      const soloVoice = primarySourceVoice || inferVoiceFromY(sorted[0], staffGroup, thresholds) || 'Bass';
+      setPlaybackVoices(sorted[0], [soloVoice], soloVoice);
       sorted[0].suppressPlayback = false;
       return sorted;
     }
-    if (sourceVoices.size <= 1) {
-      const primary = choosePrimaryNote(sorted);
-      sorted.forEach((note) => {
-        note.suppressPlayback = true;
-        note.playbackVoice = '';
-      });
-      if (primary) {
-        setPlaybackVoices(primary, ['Tenor', 'Bass'], primarySourceVoice || inferVoiceFromY(primary, staffGroup, thresholds) || 'Bass');
-        primary.suppressPlayback = false;
-      }
-      return sorted;
-    }
+
+    // Multiple lower-staff notes: route top note to Tenor, bottom note to Bass.
+    // Prevents duplicated/shared notes that can sound wrong when soloing voices.
     sorted.forEach((note, index) => {
       if (index === 0) {
         setPlaybackVoices(note, ['Tenor'], 'Tenor');

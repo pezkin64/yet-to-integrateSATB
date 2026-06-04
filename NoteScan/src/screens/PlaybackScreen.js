@@ -13,6 +13,7 @@ import {
   FlatList,
   Animated,
   Easing,
+  ActivityIndicator,
 } from 'react-native';
 import { Image } from 'react-native';
 import { File, Paths } from 'expo-file-system/next';
@@ -212,7 +213,10 @@ export const PlaybackScreen = ({ imageUri, scoreData: incomingScoreData, scoreEn
 
   // Instrument preset selection
   const [availablePresets, setAvailablePresets] = useState([]);
-  const [selectedPresetIndex, setSelectedPresetIndex] = useState(0);
+  const [selectedPresetIndex, setSelectedPresetIndex] = useState(0); // UI selection
+  const [appliedPresetIndex, setAppliedPresetIndex] = useState(0);   // debounced/applied index used for heavy work
+  const [isApplyingPreset, setIsApplyingPreset] = useState(false);
+  const _applyTimerRef = useRef(null);
   const [selectedSoundFontKey, setSelectedSoundFontKey] = useState('default');
   const [loadingSoundFontKey, setLoadingSoundFontKey] = useState('');
   const [showInstrumentPicker, setShowInstrumentPicker] = useState(false);
@@ -280,8 +284,12 @@ export const PlaybackScreen = ({ imageUri, scoreData: incomingScoreData, scoreEn
       await AudioPlaybackService.loadSoundFont(source.asset, { forceReload: true });
       const presets = orderInstrumentPresets(AudioPlaybackService.getAvailablePresets());
       setAvailablePresets(presets);
-      setSelectedPresetIndex(presets[0]?.index ?? 0);
-      AudioPlaybackService.selectPreset(presets[0]?.index ?? 0);
+      const firstIdx = presets[0]?.index ?? 0;
+      setSelectedPresetIndex(firstIdx);
+      // Immediately apply when loading a new SoundFont so the app is ready.
+      setAppliedPresetIndex(firstIdx);
+      setIsApplyingPreset(false);
+      AudioPlaybackService.selectPreset(firstIdx);
       setSelectedSoundFontKey(source.key);
     } catch (e) {
       console.warn('Failed to load SoundFont source:', e?.message || e);
@@ -690,6 +698,16 @@ export const PlaybackScreen = ({ imageUri, scoreData: incomingScoreData, scoreEn
     renderedScoreRef.current?.setVoiceSelection?.(effectiveVoiceSelection);
   }, [scoreViewMode, effectiveVoiceSelection]);
 
+  // Clear any pending apply timer on unmount
+  useEffect(() => {
+    return () => {
+      if (_applyTimerRef.current) {
+        clearTimeout(_applyTimerRef.current);
+        _applyTimerRef.current = null;
+      }
+    };
+  }, []);
+
   /* ── Phase 1: Prepare note events when scoreData or instrument changes ── */
   /* Parse notes once, build event list. No audio rendering here — just data.  */
   useEffect(() => {
@@ -714,7 +732,7 @@ export const PlaybackScreen = ({ imageUri, scoreData: incomingScoreData, scoreEn
 
       setPreparing(true);
       try {
-        AudioPlaybackService.selectPreset(selectedPresetIndex);
+        AudioPlaybackService.selectPreset(appliedPresetIndex);
         renderTempoRef.current = tempo;
 
         const playbackNotes = getLiteralPlaybackNotes(scoreData);
@@ -751,7 +769,7 @@ export const PlaybackScreen = ({ imageUri, scoreData: incomingScoreData, scoreEn
           // UI interactions (voice/tempo/preset changes) should not regenerate WAV.
           webAudioReadyRef.current = false;
           AudioPlaybackService._useWebAudio = false;
-          const renderSignature = `${selectedPresetIndex}|${Math.round(pitchHz * 10)}|${tempo}`;
+          const renderSignature = `${appliedPresetIndex}|${Math.round(pitchHz * 10)}|${tempo}`;
           const needsPreRender = !fallbackWavPreparedRef.current || fallbackRenderSignatureRef.current !== renderSignature;
           if (needsPreRender) {
             const result = await AudioPlaybackService.preRenderVoiceTracks(playbackNotes, tempo, {
@@ -789,7 +807,7 @@ export const PlaybackScreen = ({ imageUri, scoreData: incomingScoreData, scoreEn
     doPrepare();
 
     return () => { cancelled = true; };
-  }, [scoreData, selectedPresetIndex]);
+  }, [scoreData, appliedPresetIndex]);
 
   /* ── Phase 2: Voice selection changes ── */
   /* Web Audio: voice selection is applied at play-time.                        */
@@ -873,7 +891,7 @@ export const PlaybackScreen = ({ imageUri, scoreData: incomingScoreData, scoreEn
   };
 
   const ensureFallbackRenderReadyForPlay = async (myId) => {
-    const desiredRenderSignature = `${selectedPresetIndex}|${Math.round(pitchHz * 10)}|${tempo}`;
+    const desiredRenderSignature = `${appliedPresetIndex}|${Math.round(pitchHz * 10)}|${tempo}`;
     const needsPreRender = !fallbackWavPreparedRef.current || fallbackRenderSignatureRef.current !== desiredRenderSignature;
     if (!needsPreRender) return true;
 
@@ -1186,7 +1204,17 @@ export const PlaybackScreen = ({ imageUri, scoreData: incomingScoreData, scoreEn
   const handleSelectInstrument = (presetIndex) => {
     if (isPlaying) return;
     setSelectedPresetIndex(presetIndex);
+    // Close the picker quickly for UX, but debounce the expensive apply.
     setShowInstrumentPicker(false);
+    setIsApplyingPreset(true);
+    if (_applyTimerRef.current) {
+      clearTimeout(_applyTimerRef.current);
+    }
+    _applyTimerRef.current = setTimeout(() => {
+      setAppliedPresetIndex(presetIndex);
+      setIsApplyingPreset(false);
+      _applyTimerRef.current = null;
+    }, 400);
   };
 
   const handleExportMusicXml = async () => {
@@ -1330,7 +1358,7 @@ export const PlaybackScreen = ({ imageUri, scoreData: incomingScoreData, scoreEn
   };
 
   const currentInstrumentName =
-    availablePresets.find((preset) => preset.index === selectedPresetIndex)?.name || 'Piano';
+    availablePresets.find((preset) => preset.index === appliedPresetIndex)?.name || 'Piano';
   const instrumentStatusLabel = `${currentInstrumentName} (${selectedSoundFontKey}${loadingSoundFontKey ? ' loading' : ''})`;
   const pitchShiftLabel = `${Math.round(pitchHz)} Hz`;
   const livePitchShiftLabel = `${Math.round(pitchSliderHz)} Hz`;
@@ -2274,6 +2302,9 @@ export const PlaybackScreen = ({ imageUri, scoreData: incomingScoreData, scoreEn
           <View style={[styles.modalContent, { paddingBottom: insets.bottom + 16 }]}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>Select Instrument</Text>
+              {isApplyingPreset && (
+                <ActivityIndicator size="small" color={barPalette.accent} style={{ marginRight: 8 }} />
+              )}
               <TouchableOpacity onPress={() => setShowInstrumentPicker(false)}>
                 <Feather name="x" size={22} color={palette.ink} />
               </TouchableOpacity>
